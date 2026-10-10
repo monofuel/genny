@@ -54,6 +54,89 @@ exportProcs:
   bump
   getCallCount
 
-writeFiles("tests/generated_java", "testJava")
+type
+  Color = enum
+    Red
+    Green
+    Blue
+
+  Vec = object
+    x*, y*: float32
+
+  Tile = object
+    pos*: Vec
+    color*: Color
+    solid*: bool
+
+  Counter* = ref object
+    count*: int
+    color*: Color
+    history*: seq[int]
+
+  TestJavaError = object of ValueError
+
+var lastError: ref TestJavaError
+
+exportEnums:
+  Color
+
+exportObject Vec:
+  discard
+
+exportObject Tile:
+  discard
+
+proc nextColor(c: Color): Color =
+  Color((c.ord + 1) mod 3)
+
+proc moveTile(t: Tile, dx, dy: float32): Tile =
+  result = t
+  result.pos.x += dx
+  result.pos.y += dy
+
+proc newCounter(start: int): Counter =
+  Counter(count: start)
+
+proc bumpCounter(c: Counter) =
+  inc c.count
+  c.history.add c.count
+
+exportRefObject Counter:
+  fields:
+    count
+    color
+    history
+  constructor:
+    newCounter(int)
+  procs:
+    bumpCounter
+
+proc words(): seq[string] =
+  @["alpha", "beta"]
+
+exportSeq seq[string]:
+  discard
+
+proc checkError(): bool =
+  lastError != nil
+
+proc takeError(): string =
+  result = lastError.msg
+  lastError = nil
+
+proc failIfNegative(x: int): int {.raises: [TestJavaError].} =
+  if x < 0:
+    raise newException(TestJavaError, "negative: " & $x)
+  x
+
+exportProcs:
+  nextColor
+  moveTile
+  words
+  checkError
+  takeError
+  failIfNegative
+
+writeFiles("tests/generated_java", "TestJava")
 
 include generated_java/internal

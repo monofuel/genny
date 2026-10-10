@@ -76,6 +76,7 @@ macro exportEnumsTyped(body: typed) =
     when defined(gennyC): exportEnumC(sym)
     when defined(gennyCpp): exportEnumCpp(sym)
     when defined(gennyZig): exportEnumZig(sym)
+    when defined(gennyJava): exportEnumJava(sym)
 
 template exportEnums*(body: untyped) =
   ## Exports a list of enums.
@@ -198,6 +199,7 @@ macro exportObjectTyped(body: typed) =
   when defined(gennyC): exportObjectC(sym, constructor)
   when defined(gennyCpp): exportObjectCpp(sym, constructor)
   when defined(gennyZig): exportObjectZig(sym, constructor)
+  when defined(gennyJava): exportObjectJava(sym, constructor)
 
   if procsBlock[1].len > 0:
     var procsSeen: seq[string]
@@ -260,6 +262,7 @@ macro exportSeqTyped(body: typed) =
   when defined(gennyC): exportSeqC(sym)
   when defined(gennyCpp): exportSeqCpp(sym)
   when defined(gennyZig): exportSeqZig(sym)
+  when defined(gennyJava): exportSeqJava(sym)
 
   for entry in body.asStmtList()[1 .. ^1]:
     procTyped(entry, sym)
@@ -340,6 +343,7 @@ macro exportRefObjectTyped(body: typed) =
   when defined(gennyC): exportRefObjectC(sym, fields, constructor)
   when defined(gennyCpp): exportRefObjectCpp(sym, fields, constructor)
   when defined(gennyZig): exportRefObjectZig(sym, fields, constructor)
+  when defined(gennyJava): exportRefObjectJava(sym, fields, constructor)
 
   if procsBlock[1].len > 0:
     var procsSeen: seq[string]

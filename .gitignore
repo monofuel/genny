@@ -20,3 +20,4 @@ tests/generated/*_native.c
 tests/generated/*_jni.c
 tests/generated/java/
 tests/generated_java/
+*.class

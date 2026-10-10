@@ -1,4 +1,4 @@
-import genny.TestJava;
+import genny.*;
 
 public class TestJavaMain {
   static void check(boolean ok, String what) {
@@ -26,6 +26,40 @@ public class TestJavaMain {
 
     for (int i = 0; i < 3; i++) TestJava.bump();
     check(TestJava.getCallCount() == 3, "void proc + state");
+
+    check(TestJava.nextColor(Color.BLUE) == Color.RED, "enum param and return");
+
+    Tile tile = TestJava.moveTile(new Tile(new Vec(1f, 2f), Color.GREEN, true), 0.5f, -1f);
+    check(tile.pos.x == 1.5f && tile.pos.y == 1f, "nested value object");
+    check(tile.color == Color.GREEN && tile.solid, "value object enum and bool fields");
+
+    try (Counter counter = new Counter(10)) {
+      counter.bumpCounter();
+      counter.bumpCounter();
+      check(counter.getCount() == 12, "ref object constructor and proc");
+      counter.setColor(Color.BLUE);
+      check(counter.getColor() == Color.BLUE, "ref object enum field");
+      check(counter.historyLen() == 2 && counter.historyGet(1) == 12, "ref object seq field");
+    }
+
+    try (SeqString w = TestJava.words()) {
+      check(w.len() == 2 && w.get(1).equals("beta"), "seq[string]");
+      w.add("gamma");
+      check(w.get(2).equals("gamma"), "seq[string] add");
+    }
+
+    check(TestJava.failIfNegative(5) == 5, "raising proc, no error");
+    try {
+      TestJava.failIfNegative(-3);
+      check(false, "raising proc throws");
+    } catch (TestJavaException e) {
+      check(e.getMessage().equals("negative: -3"), "raising proc throws");
+    }
+
+    for (int i = 0; i < 10000; i++) new Counter(i);
+    System.gc();
+    try { Thread.sleep(200); } catch (InterruptedException e) {}
+    check(true, "Cleaner releases unclosed ref objects");
 
     System.out.println("All Java tests passed");
   }
