@@ -15,9 +15,9 @@ jobs:
         distribution: temurin
         java-version: '17'
     - name: Build standard test DLL with the Java backend
-      run: nim c --mm:arc --app:lib -d:gennyJava -o:tests/generated/libtest.so tests/test.nim
+      run: nim c --mm:arc --app:lib -d:gennyJava -d:noSignalHandler -o:tests/generated/libtest.so tests/test.nim
     - name: Build Java test DLL
-      run: nim c --mm:arc --app:lib -d:gennyJava -o:tests/generated_java/libtest_java.so tests/test_java.nim
+      run: nim c --mm:arc --app:lib -d:gennyJava -d:noSignalHandler -o:tests/generated_java/libtest_java.so tests/test_java.nim
     - name: Compile Java test
       run: javac -d tests/generated_java/classes tests/generated_java/java/genny/TestJava.java tests/TestJavaMain.java
     - name: Run Java test

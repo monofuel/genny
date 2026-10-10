@@ -4,6 +4,11 @@ import
 
 const gennyJavaPackage {.strdefine.} = "genny"
 
+when not defined(noSignalHandler):
+  # The JVM raises SIGSEGV on purpose (null checks, safepoints) and handles
+  # it itself; Nim's handler would turn those into a process exit.
+  {.error: "genny java: compile with -d:noSignalHandler, Nim's SIGSEGV handler breaks the JVM".}
+
 type JavaType = object
   java, jni, sig, c: string
 
