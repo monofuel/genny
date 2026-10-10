@@ -141,6 +141,9 @@ proc exportProcJava*(
     cWrappers.add &"  {call};\n"
     cWrappers.add cleanup.join("")
   of "String":
+    # TODO: under ARC/ORC the char* from the internal export points into a
+    # Nim string that is already freed when it returns. NewStringUTF must copy
+    # it before anything else allocates; revisit with a threadvar holder.
     cWrappers.add &"  {ret.c}genny_result = {call};\n"
     cWrappers.add cleanup.join("")
     cWrappers.add "  return (*env)->NewStringUTF(env, genny_result == NULL ? \"\" : genny_result);\n"
