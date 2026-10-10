@@ -24,6 +24,7 @@ Nim           | {.importc.}   | ✅     | ✅     | ✅          | ✅    | ✅ 
 Python        | ctypes        | ✅     | ✅     | ✅          | ✅    | ✅ |
 Node.js       | ffi-napi      | ✅     | ✅     | ✅          | ✅    | no |
 C             | .h            | ✅     | ✅     | ✅          | ✅    | no |
+Java          | JNI           | no     | no     | no          | no    | no |
 
 ## Quest for "nice" language binding.
 

@@ -7,9 +7,10 @@ when defined(gennyNode): import genny/languages/node
 when defined(gennyPython): import genny/languages/python
 when defined(gennyPythonNative): import genny/languages/python_native
 when defined(gennyZig): import genny/languages/zig
+when defined(gennyJava): import genny/languages/java
 
-when not defined(gennyNim) and not defined(gennyPython) and not defined(gennyPythonNative) and not defined(gennyNode) and not defined(gennyC) and not defined(gennyCpp) and not defined(gennyZig):
-  {.error: "Please define one of the genny languages. Use -d:gennyNim, -d:gennyPython, -d:gennyPythonNative, -d:gennyNode, -d:gennyC, -d:gennyCpp, -d:gennyZig to define the languages you want to export.".}
+when not defined(gennyNim) and not defined(gennyPython) and not defined(gennyPythonNative) and not defined(gennyNode) and not defined(gennyC) and not defined(gennyCpp) and not defined(gennyZig) and not defined(gennyJava):
+  {.error: "Please define one of the genny languages. Use -d:gennyNim, -d:gennyPython, -d:gennyPythonNative, -d:gennyNode, -d:gennyC, -d:gennyCpp, -d:gennyZig, -d:gennyJava to define the languages you want to export.".}
 
 template discard2(f: untyped): untyped =
   when(compiles do: discard f):
@@ -49,6 +50,7 @@ macro exportConstsTyped(body: typed) =
     when defined(gennyC): exportConstC(sym)
     when defined(gennyCpp): exportConstCpp(sym)
     when defined(gennyZig): exportConstZig(sym)
+    when defined(gennyJava): exportConstJava(sym)
 
 template exportConsts*(body: untyped) =
   ## Exports a list of constants.
@@ -133,6 +135,7 @@ proc procTyped(
   when defined(gennyC): exportProcC(procSym, owner, prefixes)
   when defined(gennyCpp): exportProcCpp(procSym, owner, prefixes)
   when defined(gennyZig): exportProcZig(procSym, owner, prefixes)
+  when defined(gennyJava): exportProcJava(procSym, owner, prefixes)
 
 macro exportProcsUntyped(body: untyped) =
   result = newNimNode(nnkStmtList)
@@ -216,6 +219,7 @@ macro exportObjectTyped(body: typed) =
       when defined(gennyC): exportProcC(procSym, sym, prefixes)
       when defined(gennyCpp): exportProcCpp(procSym, sym, prefixes)
       when defined(gennyZig): exportProcZig(procSym, sym, prefixes)
+      when defined(gennyJava): exportProcJava(procSym, sym, prefixes)
 
   when defined(gennyZig): exportCloseObjectZig()
   when defined(gennyCpp): exportCloseObjectCpp()
@@ -357,6 +361,7 @@ macro exportRefObjectTyped(body: typed) =
       when defined(gennyC): exportProcC(procSym, sym, prefixes)
       when defined(gennyCpp): exportProcCpp(procSym, sym, prefixes)
       when defined(gennyZig): exportProcZig(procSym, sym, prefixes)
+      when defined(gennyJava): exportProcJava(procSym, sym, prefixes)
 
   when defined(gennyCpp): exportCloseObjectCpp()
   when defined(gennyZig): exportCloseObjectZig()
@@ -380,3 +385,4 @@ macro writeFiles*(dir, lib: static[string]) =
   when defined(gennyC): writeC(dir, lib)
   when defined(gennyCpp): writeCpp(dir, lib)
   when defined(gennyZig): writeZig(dir, lib)
+  when defined(gennyJava): result.add writeJava(dir, lib)
