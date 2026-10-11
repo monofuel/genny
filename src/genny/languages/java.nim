@@ -11,7 +11,7 @@ when not defined(noSignalHandler):
 
 type
   Kind = enum
-    kVoid, kPrim, kString, kEnum, kValue, kRef, kUnsupported
+    kVoid, kPrim, kString, kEnum, kValue, kRef, kBuffer, kUnsupported
 
   JType = object
     kind: Kind
@@ -95,6 +95,10 @@ proc jtype(sym: NimNode): JType =
     prim("float", "jfloat", "F", "float", "Float")
   of "float", "float64":
     prim("double", "jdouble", "D", "double", "Double")
+  of "pointer":
+    JType(kind: kBuffer, java: "java.nio.ByteBuffer", native: "java.nio.ByteBuffer",
+      jni: "jobject", sig: "Ljava/nio/ByteBuffer;",
+      publicSig: "Ljava/nio/ByteBuffer;", c: "void *")
   of "string":
     JType(kind: kString, java: "String", native: "String", jni: "jstring",
       sig: "Ljava/lang/String;", publicSig: "Ljava/lang/String;", c: "char *")
@@ -133,6 +137,7 @@ proc cArg(t: JType, name: string, setup, cleanup: var string): string =
   of kEnum: &"({t.c}){name}"
   of kValue: &"genny_to_{t.c}(env, {name})"
   of kRef: &"(void *)(intptr_t){name}"
+  of kBuffer: &"({name} == NULL ? NULL : (*env)->GetDirectBufferAddress(env, {name}))"
   else: name
 
 proc cReturn(t: JType, expr: string): string =
@@ -263,7 +268,7 @@ proc exportProcJava*(
   apiName.add toSnakeCase(sym.repr)
 
   var
-    supported = ret.kind != kUnsupported
+    supported = ret.kind notin {kUnsupported, kBuffer}
     params: seq[(string, JType)]
   for param in procParams:
     for i in 0 .. param.len - 3:

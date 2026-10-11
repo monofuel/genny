@@ -56,6 +56,10 @@ public class TestJavaMain {
       check(e.getMessage().equals("negative: -3"), "raising proc throws");
     }
 
+    java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocateDirect(16).order(java.nio.ByteOrder.nativeOrder());
+    TestJava.fillBuffer(buf, 16, 40);
+    check(buf.getInt(0) == 40 && buf.getInt(12) == 43, "direct ByteBuffer as pointer");
+
     for (int i = 0; i < 10000; i++) new Counter(i);
     System.gc();
     try { Thread.sleep(200); } catch (InterruptedException e) {}

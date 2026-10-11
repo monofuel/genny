@@ -117,6 +117,11 @@ proc words(): seq[string] =
 exportSeq seq[string]:
   discard
 
+proc fillBuffer(buf: pointer, len: int, value: int32) =
+  let bytes = cast[ptr UncheckedArray[int32]](buf)
+  for i in 0 ..< len div 4:
+    bytes[i] = value + i.int32
+
 proc checkError(): bool =
   lastError != nil
 
@@ -130,6 +135,7 @@ proc failIfNegative(x: int): int {.raises: [TestJavaError].} =
   x
 
 exportProcs:
+  fillBuffer
   nextColor
   moveTile
   words
