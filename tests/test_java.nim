@@ -4,11 +4,24 @@ const
   javaLongConst = 123
   javaDoubleConst = 1.5
   javaStringConst = "genny"
+  javaTypedConst = 42'i32
+  javaUnsignedConst = 0xFFFF_FFFF'u32
+  javaBoolConst = true
+  javaFloatConst = 0.25'f32
+  javaEscapedConst = "a\0b\"\\\né😀"
 
 exportConsts:
   javaLongConst
   javaDoubleConst
   javaStringConst
+  javaTypedConst
+  javaUnsignedConst
+  javaBoolConst
+  javaFloatConst
+  javaEscapedConst
+
+var initCount {.noinit.}: int
+inc initCount
 
 proc addInts(a, b: int): int =
   a + b
@@ -42,6 +55,18 @@ proc bump() =
 proc getCallCount(): int =
   callCount
 
+proc getInitCount(): int =
+  initCount
+
+proc utf8Len(s: string): int =
+  s.len
+
+proc invalidUtf8(): string =
+  "a\xffb"
+
+proc clampTo(x, default: int): int =
+  if x < 0: default else: x
+
 exportProcs:
   addInts
   addInt32s
@@ -53,6 +78,10 @@ exportProcs:
   helloWorld
   bump
   getCallCount
+  getInitCount
+  utf8Len
+  invalidUtf8
+  clampTo
 
 type
   Color = enum
@@ -68,22 +97,54 @@ type
     color*: Color
     solid*: bool
 
+  Level {.size: 4.} = enum
+    Low = 1
+    Mid = "mid"
+    High = (10, "high")
+
+  Reading = object
+    level*: Level
+    amount*: int32
+
+  Big {.bycopy.} = object
+    a*, b*, c*, d*: int64
+
+  Tracker = object
+    live: bool
+
   Counter* = ref object
     count*: int
     color*: Color
     history*: seq[int]
+    data*: pointer
+    tracker: Tracker
 
   TestJavaError = object of ValueError
 
-var lastError: ref TestJavaError
+var
+  lastError: ref TestJavaError
+  destroyedCount: int
+
+proc `=destroy`(t: Tracker) =
+  if t.live:
+    inc destroyedCount
+
+proc `=copy`(a: var Tracker, b: Tracker) {.error.}
 
 exportEnums:
   Color
+  Level
 
 exportObject Vec:
   discard
 
 exportObject Tile:
+  discard
+
+exportObject Reading:
+  discard
+
+exportObject Big:
   discard
 
 proc nextColor(c: Color): Color =
@@ -101,15 +162,45 @@ proc bumpCounter(c: Counter) =
   inc c.count
   c.history.add c.count
 
+proc scaled(c: Counter, by: int): int =
+  c.count * by
+
+proc scaled(c: Counter, by: int64): int =
+  c.count * by.int * 2
+
 exportRefObject Counter:
   fields:
     count
     color
     history
+    data
   constructor:
     newCounter(int)
   procs:
     bumpCounter
+    scaled(Counter, int)
+    scaled(Counter, int64)
+
+proc makeCounter(start: int): Counter =
+  Counter(count: start, tracker: Tracker(live: true))
+
+proc getDestroyedCount(): int =
+  destroyedCount
+
+proc sameCount(a, b: Counter): bool =
+  a.count == b.count
+
+proc nextLevel(l: Level): Level =
+  if l == Low: Mid else: High
+
+proc boostReading(r: Reading): Reading =
+  Reading(level: nextLevel(r.level), amount: r.amount * 2)
+
+proc sumBig(b: Big): int64 =
+  b.a + b.b + b.c + b.d
+
+proc makeBig(x: int64): Big =
+  Big(a: x, b: x + 1, c: x + 2, d: x + 3)
 
 proc words(): seq[string] =
   @["alpha", "beta"]
@@ -131,7 +222,7 @@ proc takeError(): string =
 
 proc failIfNegative(x: int): int {.raises: [TestJavaError].} =
   if x < 0:
-    raise newException(TestJavaError, "negative: " & $x)
+    raise newException(TestJavaError, "negative: " & $x & " ✗")
   x
 
 exportProcs:
@@ -142,6 +233,13 @@ exportProcs:
   checkError
   takeError
   failIfNegative
+  makeCounter
+  getDestroyedCount
+  sameCount
+  nextLevel
+  boostReading
+  sumBig
+  makeBig
 
 writeFiles("tests/generated_java", "TestJava")
 
