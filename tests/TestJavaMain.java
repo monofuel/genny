@@ -27,6 +27,10 @@ public class TestJavaMain {
     TestJava.load(new java.io.File(args[0]).getAbsolutePath());
 
     check(TestJava.getInitCount() == 1, "Nim initializes once");
+    check(!TestJava.hotReloadable(), "normal build is not hot reloadable");
+    throwsType(UnsupportedOperationException.class, () -> TestJava.reload("/nonexistent.so"),
+      "reload on a normal build");
+    check(TestJava.addInts(1, 2) == 3, "normal build still works after reload is refused");
 
     check(TestJava.JAVA_LONG_CONST == 123L, "long const");
     check(TestJava.JAVA_DOUBLE_CONST == 1.5, "double const");

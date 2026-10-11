@@ -49,7 +49,7 @@ var
   refNames {.compiletime.}: HashSet[string]
   javaSigs {.compiletime.}: HashSet[string]
   cTypes {.compiletime.}: string
-  cProtos {.compiletime.}: string
+  cExports {.compiletime.}: OrderedTable[string, (string, string)]
   cHelpers {.compiletime.}: string
   cWrappers {.compiletime.}: string
   cMethods {.compiletime.}: string
@@ -219,7 +219,8 @@ proc emitNative(
       callArgs.add p
 
   libMembers.add &"  static native {ret.native} {nativeName}({javaParams.join(\", \")});\n"
-  cProtos.add &"extern {ret.c} {apiName}({cProtoParams.join(\", \")});\n"
+  if apiName notin cExports:
+    cExports[apiName] = (ret.c, cProtoParams.join(", "))
 
   var allJniParams = @["JNIEnv *env", "jclass cls"]
   allJniParams.add jniParams
@@ -230,6 +231,12 @@ proc emitNative(
   else: cWrappers.add &"  {ret.jni} genny_ret = 0;\n"
   cWrappers.add decls
   cWrappers.add "  (void)env; (void)cls;\n"
+  cWrappers.add "#ifdef GENNY_JAVA_HOT_RELOAD\n"
+  cWrappers.add "  if (!genny_bound) {\n"
+  cWrappers.add "    genny_throw(env, \"java/lang/IllegalStateException\", \"native library not loaded\");\n"
+  cWrappers.add(if ret.kind == kVoid: "    return;\n" else: "    return genny_ret;\n")
+  cWrappers.add "  }\n"
+  cWrappers.add "#endif\n"
   cWrappers.add setup
   let call = &"{apiName}({callArgs.join(\", \")})"
   cWrappers.add "  {\n"
@@ -675,16 +682,19 @@ proc emitHandleClass(name, unrefApi: string) =
   discard claim(name, "close", @[])
   var code = ""
   code.add "  private long handle$;\n"
+  code.add "  private final int generation$;\n"
   code.add "  private final java.lang.ref.Cleaner.Cleanable cleanable$;\n\n"
   code.add &"  private {name}(long handle, java.lang.Void unused) {{\n"
   code.add &"    if (handle == 0L) throw new java.lang.IllegalStateException(\"{name} is nil\");\n"
   code.add "    this.handle$ = handle;\n"
-  code.add &"    this.cleanable$ = {libClass}.CLEANER$.register(this, new {libClass}.Release$(handle, {libClass}::{unrefNative}));\n"
+  code.add &"    this.generation$ = {libClass}.GENERATION$;\n"
+  code.add &"    this.cleanable$ = {libClass}.CLEANER$.register(this, new {libClass}.Release$(handle, generation$, {libClass}::{unrefNative}));\n"
   code.add "  }\n\n"
   code.add &"  static {name} wrap$(long handle) {{\n"
   code.add &"    return handle == 0L ? null : new {name}(handle, null);\n"
   code.add "  }\n\n"
   code.add "  long handle$() {\n"
+  code.add &"    if (generation$ != {libClass}.GENERATION$) throw new java.lang.IllegalStateException(\"handle from a previous native library generation\");\n"
   code.add &"    if (handle$ == 0L) throw new java.lang.IllegalStateException(\"{name} is closed\");\n"
   code.add "    return handle$;\n"
   code.add "  }\n\n"
@@ -951,6 +961,11 @@ proc writeJava*(dir, lib: string): NimNode =
     if name in [className, exceptionClass]:
       error(&"genny java: type {name} clashes with the generated {name}.java")
 
+  if not claim(libClass, "reload", @["java.lang.String"]) or
+      not claim(libClass, "hotReloadable", @[]) or
+      "\"n_genny_reload\"" in cMethods or "\"n_genny_hot_reloadable\"" in cMethods:
+    error("genny java: an export clashes with the generated reload or hotReloadable")
+
   createDir(javaDir)
 
   proc header(): string =
@@ -961,15 +976,21 @@ proc writeJava*(dir, lib: string): NimNode =
   java.add &"  private {className}() {{}}\n\n"
   java.add "  static final java.lang.ref.Cleaner CLEANER$ = java.lang.ref.Cleaner.create();\n"
   java.add &"  private static final java.util.concurrent.ConcurrentLinkedQueue<Release$> PENDING$ =\n"
-  java.add "    new java.util.concurrent.ConcurrentLinkedQueue<>();\n\n"
+  java.add "    new java.util.concurrent.ConcurrentLinkedQueue<>();\n"
+  java.add "  /** Bumped by every reload; handles from an older generation are dead. */\n"
+  java.add "  static volatile int GENERATION$;\n\n"
   java.add "  static final class Release$ implements java.lang.Runnable {\n"
   java.add "    private final long handle;\n"
+  java.add "    private final int generation;\n"
   java.add "    private final java.util.function.LongConsumer unref;\n\n"
-  java.add "    Release$(long handle, java.util.function.LongConsumer unref) {\n"
+  java.add "    Release$(long handle, int generation, java.util.function.LongConsumer unref) {\n"
   java.add "      this.handle = handle;\n"
+  java.add "      this.generation = generation;\n"
   java.add "      this.unref = unref;\n"
   java.add "    }\n\n"
-  java.add "    @java.lang.Override public void run() { PENDING$.add(this); }\n"
+  java.add "    @java.lang.Override public void run() {\n"
+  java.add "      if (generation == GENERATION$) PENDING$.add(this);\n"
+  java.add "    }\n"
   java.add "  }\n\n"
   java.add "  /** Loads the native library from an absolute path. */\n"
   java.add "  public static void load(java.lang.String absolutePath) {\n"
@@ -978,8 +999,27 @@ proc writeJava*(dir, lib: string): NimNode =
   java.add "  /** Releases Nim objects whose Java wrappers were garbage collected. Every call into the library does this first. */\n"
   java.add "  public static void releasePending() {\n"
   java.add "    Release$ r;\n"
-  java.add "    while ((r = PENDING$.poll()) != null) r.unref.accept(r.handle);\n"
+  java.add "    while ((r = PENDING$.poll()) != null) {\n"
+  java.add "      if (r.generation == GENERATION$) r.unref.accept(r.handle);\n"
+  java.add "    }\n"
   java.add "  }\n\n"
+  java.add "  /**\n"
+  java.add "   * Development only: binds the library to the Nim library at absolutePath. Needs a\n"
+  java.add "   * loader built with GENNY_JAVA_HOT_RELOAD, otherwise it throws UnsupportedOperationException.\n"
+  java.add "   * Handles created before a successful reload throw IllegalStateException afterwards.\n"
+  java.add "   * A failed reload throws IllegalStateException and keeps the current library.\n"
+  java.add "   */\n"
+  java.add "  public static synchronized void reload(java.lang.String absolutePath) {\n"
+  java.add "    PENDING$.clear();\n"
+  java.add "    n_genny_reload(absolutePath);\n"
+  java.add "    GENERATION$ = GENERATION$ + 1;\n"
+  java.add "  }\n\n"
+  java.add "  /** True when the loaded library was built with GENNY_JAVA_HOT_RELOAD. */\n"
+  java.add "  public static boolean hotReloadable() {\n"
+  java.add "    return n_genny_hot_reloadable();\n"
+  java.add "  }\n\n"
+  java.add "  static native void n_genny_reload(java.lang.String path);\n"
+  java.add "  static native boolean n_genny_hot_reloadable();\n"
   java.add libMembers
   java.add "}\n"
   writeFile(javaDir / (className & ".java"), java.replace(libClass, className))
@@ -1021,17 +1061,47 @@ proc writeJava*(dir, lib: string): NimNode =
     code.add "}\n"
     writeFile(javaDir / (name & ".java"), code.replace(libClass, className))
 
+  # Nim exports are plain externs, or with GENNY_JAVA_HOT_RELOAD function
+  # pointers that n_genny_reload binds to a dlopened Nim library.
+  var
+    bound: seq[(string, string, string)]
+    boundNames: HashSet[string]
+  proc protos(entries: seq[(string, (string, string))]): string =
+    var hot, normal: string
+    for (name, sig) in entries:
+      let (ret, params) = sig
+      if name in boundNames:
+        continue
+      boundNames.incl name
+      let fnParams = if params == "": "void" else: params
+      bound.add((name, ret, fnParams))
+      hot.add &"static {ret} (*{name})({fnParams});\n"
+      normal.add &"extern {ret} {name}({params});\n"
+    if hot != "":
+      result = "#ifdef GENNY_JAVA_HOT_RELOAD\n" & hot & "#else\n" & normal & "#endif\n"
+
   var code = ""
   code.add "#include <jni.h>\n"
   code.add "#include <stdbool.h>\n"
   code.add "#include <stdint.h>\n"
   code.add "#include <stdlib.h>\n"
-  code.add "#include <string.h>\n\n"
+  code.add "#include <string.h>\n"
+  code.add "#ifdef GENNY_JAVA_HOT_RELOAD\n"
+  code.add "#include <dlfcn.h>\n"
+  code.add "#include <stdio.h>\n\n"
+  code.add "static void *genny_handle = NULL;\n"
+  code.add "static int genny_bound = 0;\n"
+  code.add "#endif\n\n"
   if not nimInitializes:
-    code.add "extern void NimMain(void);\n\n"
+    # The dlopened Nim library of a hot reload build initializes itself.
+    code.add "#ifndef GENNY_JAVA_HOT_RELOAD\n"
+    code.add "extern void NimMain(void);\n"
+    code.add "#endif\n\n"
   if needsErrorBridge:
-    code.add "extern bool $lib_check_error(void);\n"
-    code.add "extern char *$lib_take_error(void);\n"
+    code.add protos(@[
+      ("$lib_check_error", ("bool", "void")),
+      ("$lib_take_error", ("char *", "void"))
+    ])
   code.add "static jclass genny_exception_class;\n"
   code.add "static jmethodID genny_exception_init;\n"
   for name in enumEntries.keys:
@@ -1067,12 +1137,83 @@ proc writeJava*(dir, lib: string): NimNode =
     code.add "  (*env)->DeleteLocalRef(env, e);\n"
     code.add "}\n\n"
   code.add cTypes
-  code.add cProtos
+  var exports: seq[(string, (string, string))]
+  for name, sig in cExports:
+    exports.add((name, sig))
+  code.add protos(exports)
   code.add "\n"
   code.add cHelpers
   code.add cWrappers
+
+  code.add "#ifdef GENNY_JAVA_HOT_RELOAD\n"
+  code.add "/* Resolves every export in h; the pointers change only when all are found. */\n"
+  code.add "static const char *genny_bind(void *h) {\n"
+  if bound.len == 0:
+    code.add "  (void)h;\n"
+  else:
+    code.add "  static const char *const names[] = {\n"
+    for (name, _, _) in bound:
+      code.add &"    \"{name}\",\n"
+    code.add "  };\n"
+    code.add &"  void *syms[{bound.len}];\n"
+    code.add "  size_t i;\n"
+    code.add "  for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {\n"
+    code.add "    syms[i] = dlsym(h, names[i]);\n"
+    code.add "    if (syms[i] == NULL) return names[i];\n"
+    code.add "  }\n"
+    for i, (name, ret, params) in bound:
+      code.add &"  {name} = ({ret} (*)({params}))syms[{i}];\n"
+  code.add "  return NULL;\n"
+  code.add "}\n\n"
+  code.add "static void JNICALL genny_jni_genny_reload(JNIEnv *env, jclass cls, jstring path) {\n"
+  code.add "  const char *p;\n"
+  code.add "  const char *missing;\n"
+  code.add "  void *h;\n"
+  code.add "  (void)cls;\n"
+  code.add "  if (path == NULL) {\n"
+  code.add "    genny_throw(env, \"java/lang/NullPointerException\", \"path is null\");\n"
+  code.add "    return;\n"
+  code.add "  }\n"
+  code.add "  p = (*env)->GetStringUTFChars(env, path, NULL);\n"
+  code.add "  if (p == NULL) return;\n"
+  code.add "  h = dlopen(p, RTLD_NOW | RTLD_LOCAL);\n"
+  code.add "  (*env)->ReleaseStringUTFChars(env, path, p);\n"
+  code.add "  if (h == NULL) {\n"
+  code.add "    const char *e = dlerror();\n"
+  code.add "    genny_throw(env, \"java/lang/IllegalStateException\", e == NULL ? \"dlopen failed\" : e);\n"
+  code.add "    return;\n"
+  code.add "  }\n"
+  code.add "  missing = genny_bind(h);\n"
+  code.add "  if (missing != NULL) {\n"
+  code.add "    char message[512];\n"
+  code.add "    snprintf(message, sizeof(message), \"native library is missing symbol %s\", missing);\n"
+  code.add "    dlclose(h);\n"
+  code.add "    genny_throw(env, \"java/lang/IllegalStateException\", message);\n"
+  code.add "    return;\n"
+  code.add "  }\n"
+  code.add "  if (genny_handle != NULL) dlclose(genny_handle);\n"
+  code.add "  genny_handle = h;\n"
+  code.add "  genny_bound = 1;\n"
+  code.add "}\n"
+  code.add "#else\n"
+  code.add "static void JNICALL genny_jni_genny_reload(JNIEnv *env, jclass cls, jstring path) {\n"
+  code.add "  (void)cls; (void)path;\n"
+  code.add "  genny_throw(env, \"java/lang/UnsupportedOperationException\", \"built without GENNY_JAVA_HOT_RELOAD\");\n"
+  code.add "}\n"
+  code.add "#endif\n\n"
+  code.add "static jboolean JNICALL genny_jni_genny_hot_reloadable(JNIEnv *env, jclass cls) {\n"
+  code.add "  (void)env; (void)cls;\n"
+  code.add "#ifdef GENNY_JAVA_HOT_RELOAD\n"
+  code.add "  return JNI_TRUE;\n"
+  code.add "#else\n"
+  code.add "  return JNI_FALSE;\n"
+  code.add "#endif\n"
+  code.add "}\n\n"
+
   code.add "static JNINativeMethod genny_jni_methods[] = {\n"
   code.add cMethods
+  code.add "  {\"n_genny_reload\", \"(Ljava/lang/String;)V\", (void *)genny_jni_genny_reload},\n"
+  code.add "  {\"n_genny_hot_reloadable\", \"()Z\", (void *)genny_jni_genny_hot_reloadable},\n"
   code.add "};\n\n"
   code.add "JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {\n"
   code.add "  JNIEnv *env;\n"
@@ -1081,7 +1222,9 @@ proc writeJava*(dir, lib: string): NimNode =
   code.add "  (void)reserved;\n"
   code.add "  if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_8) != JNI_OK) return JNI_ERR;\n"
   if not nimInitializes:
+    code.add "#ifndef GENNY_JAVA_HOT_RELOAD\n"
     code.add "  NimMain();\n"
+    code.add "#endif\n"
   code.add &"  if (!genny_load_class(env, \"{classPath(exceptionClass)}\", &genny_exception_class)) return JNI_ERR;\n"
   code.add "  genny_exception_init = (*env)->GetMethodID(env, genny_exception_class, \"<init>\", \"(Ljava/lang/String;)V\");\n"
   code.add "  if (genny_exception_init == NULL) return JNI_ERR;\n"

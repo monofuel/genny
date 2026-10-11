@@ -46,6 +46,28 @@ javac -d classes bindings/generated/java/genny/*.java
 * Overloads that end up with the same Java signature get the overload prefix appended, e.g. `scaledInt64`.
 * Like the other backends, a ref object built by its exported constructor keeps one extra Nim reference and is never freed.
 
+### Hot reload (development)
+
+The JVM cannot unload a JNI library. For development, build the generated C on its own as a small loader with `-DGENNY_JAVA_HOT_RELOAD`; Java loads the loader once and it `dlopen`s the real Nim library, so the Nim code can be rebuilt and swapped while the JVM keeps running. It uses `dlopen`, so it is not available on Windows:
+
+```sh
+nim c --mm:arc --app:lib -d:gennyJava -d:noSignalHandler -o:build/libpixie-1.so bindings.nim
+cc -shared -fPIC -DGENNY_JAVA_HOT_RELOAD -I$JAVA_HOME/include -I$JAVA_HOME/include/linux \
+  bindings/generated/pixie_jni.c -ldl -o libpixie_loader.so
+```
+
+```java
+Pixie.load("/abs/libpixie_loader.so");
+Pixie.reload("/abs/build/libpixie-1.so"); // and again after every rebuild
+```
+
+* Every call throws `IllegalStateException` until the first successful `reload`. `Pixie.hotReloadable()` tells a loader from a normal build, where `reload` throws `UnsupportedOperationException`.
+* A reload that cannot open the library or finds a missing export throws `IllegalStateException` and keeps the current library.
+* Each successful reload starts a new generation. Ref objects and seqs from an older generation throw `IllegalStateException` when used, and closing or collecting them does nothing; pending releases are dropped.
+* Copy each build to a new path before reloading: `dlopen` hands back the already loaded library for the same file.
+* Stop every thread that runs Nim code, and every call into the library, before reloading: the old library is unloaded.
+* The exported API must stay the same between reloads; regenerate and rebuild the loader (and restart the JVM) when it changes.
+
 ## Quest for "nice" language binding.
 
 It would be pretty easy to just export a C API from Nim and have users call the ugly C style methods but that is not our goal with Genny. Instead, we try to generate a "nice" API for each language that feels like it was custom-made. This means, where possible, we:
