@@ -26,6 +26,26 @@ Node.js       | ffi-napi      | ✅     | ✅     | ✅          | ✅    | no |
 C             | .h            | ✅     | ✅     | ✅          | ✅    | no |
 Java          | JNI           | ✅     | ✅     | ✅          | ✅    | ✅ |
 
+## Java
+
+Build the library with `JAVA_HOME` pointing at a JDK (9 or newer):
+
+```sh
+nim c --mm:arc --app:lib -d:gennyJava -d:noSignalHandler -o:libpixie.so bindings.nim
+javac -d classes bindings/generated/java/genny/*.java
+```
+
+`-d:noSignalHandler` is required: the JVM uses `SIGSEGV` internally. The package defaults to `genny`; change it with `-d:gennyJavaPackage=com.example.pixie`. Load the library once with `Pixie.load("/absolute/path/libpixie.so")`.
+
+* Ref objects and seqs are `AutoCloseable`. `close()` releases the Nim object right away; otherwise a `Cleaner` queues the release and it runs at the start of the next call into the library (or `Pixie.releasePending()`).
+* Nim's reference counts and the error state of raising procs are not thread-safe: call the library from one thread at a time.
+* Unsigned integers keep their bits in the signed Java type of the same size; Nim `int` is a Java `long`.
+* Strings are converted to and from UTF-8. A string containing `\0` is cut there, like in the C API.
+* `pointer` parameters take direct `ByteBuffer`s (or `null`); Nim gets the buffer's base address in native byte order and must not keep it after the call. Heap buffers throw `IllegalArgumentException`.
+* Value objects are copied in and out as C structs. Objects over 24 bytes must be `{.bycopy.}`; inherited, packed and variant objects are skipped with a warning.
+* Overloads that end up with the same Java signature get the overload prefix appended, e.g. `scaledInt64`.
+* Like the other backends, a ref object built by its exported constructor keeps one extra Nim reference and is never freed.
+
 ## Quest for "nice" language binding.
 
 It would be pretty easy to just export a C API from Nim and have users call the ugly C style methods but that is not our goal with Genny. Instead, we try to generate a "nice" API for each language that feels like it was custom-made. This means, where possible, we:
