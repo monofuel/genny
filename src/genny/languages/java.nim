@@ -248,11 +248,8 @@ proc emitNative(
   case ret.kind
   of kVoid: discard
   of kString:
-    # TODO: under ARC/ORC the char* from the internal export points into a
-    # Nim string that is already freed when it returns. It is copied here
-    # before anything else allocates; revisit with a threadvar holder.
     needsStrings = true
-    store = "genny_ret = genny_jstring_from_utf8(env, genny_result);"
+    store = "{ genny_ret = genny_jstring_from_utf8(env, genny_result); $lib_java_release_string(); }"
   of kPrim:
     store =
       if ret.java == "boolean": "genny_ret = genny_result ? JNI_TRUE : JNI_FALSE;"
@@ -682,7 +679,7 @@ proc emitHandleClass(name, unrefApi: string) =
   discard claim(name, "close", @[])
   var code = ""
   code.add "  private long handle$;\n"
-  code.add "  private final int generation$;\n"
+  code.add "  private final long generation$;\n"
   code.add "  private final java.lang.ref.Cleaner.Cleanable cleanable$;\n\n"
   code.add &"  private {name}(long handle, java.lang.Void unused) {{\n"
   code.add &"    if (handle == 0L) throw new java.lang.IllegalStateException(\"{name} is nil\");\n"
@@ -946,6 +943,18 @@ static jstring genny_jstring_from_utf8(JNIEnv *env, const char *s) {
 """
 
 proc writeJava*(dir, lib: string): NimNode =
+  var schema = cTypes & cMethods & libMembers & $needsErrorBridge & "genny-transaction-v2-owned-strings"
+  schema.add "$lib_java_release_string:void(void)"
+  for name, signature in cExports:
+    schema.add name & signature[0] & signature[1]
+  for name, members in classMembers:
+    schema.add name & members
+  for name, entries in enumEntries:
+    schema.add name & $entries
+  var fingerprint = 14695981039346656037'u64
+  for ch in schema:
+    fingerprint = (fingerprint xor ch.uint64) * 1099511628211'u64
+  let abi = fingerprint.toHex(16)
   let
     className = javaClassName(lib)
     javaDir = dir / "java" / gennyJavaPackage.replace('.', '/')
@@ -965,6 +974,11 @@ proc writeJava*(dir, lib: string): NimNode =
       not claim(libClass, "hotReloadable", @[]) or
       "\"n_genny_reload\"" in cMethods or "\"n_genny_hot_reloadable\"" in cMethods:
     error("genny java: an export clashes with the generated reload or hotReloadable")
+  for phase in ["activate", "rollback", "commit", "cancel"]:
+    if not claim(libClass, phase & "Reload", @[]):
+      error("genny java: an export clashes with the generated reload transaction")
+  if not claim(libClass, "prepareReload", @["java.lang.String"]) or libMembers.contains("ABI_FINGERPRINT"):
+    error("genny java: an export clashes with the generated reload ABI")
 
   createDir(javaDir)
 
@@ -977,19 +991,23 @@ proc writeJava*(dir, lib: string): NimNode =
   java.add "  static final java.lang.ref.Cleaner CLEANER$ = java.lang.ref.Cleaner.create();\n"
   java.add &"  private static final java.util.concurrent.ConcurrentLinkedQueue<Release$> PENDING$ =\n"
   java.add "    new java.util.concurrent.ConcurrentLinkedQueue<>();\n"
+  java.add "  private static final java.util.Set<Release$> LIVE$ = java.util.concurrent.ConcurrentHashMap.newKeySet();\n"
+  java.add "  private static boolean PREPARED$, ACTIVE$;\n"
   java.add "  /** Bumped by every reload; handles from an older generation are dead. */\n"
-  java.add "  static volatile int GENERATION$;\n\n"
+  java.add "  static volatile long GENERATION$;\n\n"
   java.add "  static final class Release$ implements java.lang.Runnable {\n"
   java.add "    private final long handle;\n"
-  java.add "    private final int generation;\n"
+  java.add "    private final long generation;\n"
   java.add "    private final java.util.function.LongConsumer unref;\n\n"
-  java.add "    Release$(long handle, int generation, java.util.function.LongConsumer unref) {\n"
+  java.add "    private final java.util.concurrent.atomic.AtomicBoolean released = new java.util.concurrent.atomic.AtomicBoolean();\n"
+  java.add "    Release$(long handle, long generation, java.util.function.LongConsumer unref) {\n"
   java.add "      this.handle = handle;\n"
   java.add "      this.generation = generation;\n"
   java.add "      this.unref = unref;\n"
+  java.add &"      synchronized ({className}.class) {{ LIVE$.add(this); }}\n"
   java.add "    }\n\n"
   java.add "    @java.lang.Override public void run() {\n"
-  java.add "      if (generation == GENERATION$) PENDING$.add(this);\n"
+  java.add &"      synchronized ({className}.class) {{ if (released.compareAndSet(false, true)) {{ LIVE$.remove(this); if (generation == GENERATION$) PENDING$.add(this); }} }}\n"
   java.add "    }\n"
   java.add "  }\n\n"
   java.add "  /** Loads the native library from an absolute path. */\n"
@@ -1003,6 +1021,7 @@ proc writeJava*(dir, lib: string): NimNode =
   java.add "      if (r.generation == GENERATION$) r.unref.accept(r.handle);\n"
   java.add "    }\n"
   java.add "  }\n\n"
+  java.add "  private static void releaseGeneration$() { for (Release$ r : LIVE$) r.run(); releasePending(); }\n"
   java.add "  /**\n"
   java.add "   * Development only: binds the library to the Nim library at absolutePath. Needs a\n"
   java.add "   * loader built with GENNY_JAVA_HOT_RELOAD, otherwise it throws UnsupportedOperationException.\n"
@@ -1010,15 +1029,26 @@ proc writeJava*(dir, lib: string): NimNode =
   java.add "   * A failed reload throws IllegalStateException and keeps the current library.\n"
   java.add "   */\n"
   java.add "  public static synchronized void reload(java.lang.String absolutePath) {\n"
-  java.add "    PENDING$.clear();\n"
-  java.add "    n_genny_reload(absolutePath);\n"
-  java.add "    GENERATION$ = GENERATION$ + 1;\n"
+  java.add "    prepareReload(absolutePath);\n"
+  java.add "    activateReload();\n"
+  java.add "    commitReload();\n"
   java.add "  }\n\n"
   java.add "  /** True when the loaded library was built with GENNY_JAVA_HOT_RELOAD. */\n"
   java.add "  public static boolean hotReloadable() {\n"
   java.add "    return n_genny_hot_reloadable();\n"
   java.add "  }\n\n"
   java.add "  static native void n_genny_reload(java.lang.String path);\n"
+  java.add &"  public static final String ABI_FINGERPRINT = \"{abi}\";\n"
+  java.add "  public static synchronized void prepareReload(String path) { releasePending(); n_genny_prepare(path); PREPARED$ = true; }\n"
+  java.add "  public static synchronized void activateReload() { if (!PREPARED$ || ACTIVE$) throw new IllegalStateException(\"no prepared reload\"); releaseGeneration$(); n_genny_activate(); GENERATION$++; PREPARED$ = false; ACTIVE$ = true; }\n"
+  java.add "  public static synchronized void rollbackReload() { if (!ACTIVE$) throw new IllegalStateException(\"no activated reload\"); releaseGeneration$(); n_genny_rollback(); GENERATION$++; ACTIVE$ = false; }\n"
+  java.add "  public static synchronized void commitReload() { releasePending(); n_genny_commit(); ACTIVE$ = false; }\n"
+  java.add "  public static synchronized void cancelReload() { n_genny_cancel(); PREPARED$ = false; }\n"
+  java.add "  static native void n_genny_prepare(String path);\n"
+  java.add "  static native void n_genny_activate();\n"
+  java.add "  static native void n_genny_rollback();\n"
+  java.add "  static native void n_genny_commit();\n"
+  java.add "  static native void n_genny_cancel();\n"
   java.add "  static native boolean n_genny_hot_reloadable();\n"
   java.add libMembers
   java.add "}\n"
@@ -1086,6 +1116,9 @@ proc writeJava*(dir, lib: string): NimNode =
   code.add "#include <stdint.h>\n"
   code.add "#include <stdlib.h>\n"
   code.add "#include <string.h>\n"
+  code.add "#ifndef GENNY_JAVA_HOT_RELOAD\n"
+  code.add &"__attribute__((visibility(\"default\"))) const char *genny_abi_fingerprint(void) {{ return \"{abi}\"; }}\n"
+  code.add "#endif\n"
   code.add "#ifdef GENNY_JAVA_HOT_RELOAD\n"
   code.add "#include <dlfcn.h>\n"
   code.add "#include <stdio.h>\n\n"
@@ -1102,6 +1135,8 @@ proc writeJava*(dir, lib: string): NimNode =
       ("$lib_check_error", ("bool", "void")),
       ("$lib_take_error", ("char *", "void"))
     ])
+  if needsStrings:
+    code.add protos(@[("$lib_java_release_string", ("void", "void"))])
   code.add "static jclass genny_exception_class;\n"
   code.add "static jmethodID genny_exception_init;\n"
   for name in enumEntries.keys:
@@ -1128,6 +1163,7 @@ proc writeJava*(dir, lib: string): NimNode =
     code.add "static void genny_raise(JNIEnv *env) {\n"
     code.add "  char *message = $lib_take_error();\n"
     code.add "  jstring jmessage = genny_jstring_from_utf8(env, message == NULL ? \"error\" : message);\n"
+    code.add "  $lib_java_release_string();\n"
     code.add "  jthrowable e;\n"
     code.add "  if (jmessage == NULL) return;\n"
     code.add "  e = (jthrowable)(*env)->NewObject(env, genny_exception_class, genny_exception_init, jmessage);\n"
@@ -1145,62 +1181,99 @@ proc writeJava*(dir, lib: string): NimNode =
   code.add cHelpers
   code.add cWrappers
 
-  code.add "#ifdef GENNY_JAVA_HOT_RELOAD\n"
-  code.add "/* Resolves every export in h; the pointers change only when all are found. */\n"
-  code.add "static const char *genny_bind(void *h) {\n"
-  if bound.len == 0:
-    code.add "  (void)h;\n"
-  else:
-    code.add "  static const char *const names[] = {\n"
-    for (name, _, _) in bound:
-      code.add &"    \"{name}\",\n"
-    code.add "  };\n"
-    code.add &"  void *syms[{bound.len}];\n"
-    code.add "  size_t i;\n"
-    code.add "  for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {\n"
-    code.add "    syms[i] = dlsym(h, names[i]);\n"
-    code.add "    if (syms[i] == NULL) return names[i];\n"
-    code.add "  }\n"
-    for i, (name, ret, params) in bound:
-      code.add &"  {name} = ({ret} (*)({params}))syms[{i}];\n"
-  code.add "  return NULL;\n"
-  code.add "}\n\n"
-  code.add "static void JNICALL genny_jni_genny_reload(JNIEnv *env, jclass cls, jstring path) {\n"
-  code.add "  const char *p;\n"
-  code.add "  const char *missing;\n"
-  code.add "  void *h;\n"
-  code.add "  (void)cls;\n"
-  code.add "  if (path == NULL) {\n"
-  code.add "    genny_throw(env, \"java/lang/NullPointerException\", \"path is null\");\n"
-  code.add "    return;\n"
-  code.add "  }\n"
-  code.add "  p = (*env)->GetStringUTFChars(env, path, NULL);\n"
-  code.add "  if (p == NULL) return;\n"
-  code.add "  h = dlopen(p, RTLD_NOW | RTLD_LOCAL);\n"
-  code.add "  (*env)->ReleaseStringUTFChars(env, path, p);\n"
-  code.add "  if (h == NULL) {\n"
-  code.add "    const char *e = dlerror();\n"
-  code.add "    genny_throw(env, \"java/lang/IllegalStateException\", e == NULL ? \"dlopen failed\" : e);\n"
-  code.add "    return;\n"
-  code.add "  }\n"
-  code.add "  missing = genny_bind(h);\n"
-  code.add "  if (missing != NULL) {\n"
-  code.add "    char message[512];\n"
-  code.add "    snprintf(message, sizeof(message), \"native library is missing symbol %s\", missing);\n"
-  code.add "    dlclose(h);\n"
-  code.add "    genny_throw(env, \"java/lang/IllegalStateException\", message);\n"
-  code.add "    return;\n"
-  code.add "  }\n"
-  code.add "  if (genny_handle != NULL) dlclose(genny_handle);\n"
-  code.add "  genny_handle = h;\n"
-  code.add "  genny_bound = 1;\n"
-  code.add "}\n"
-  code.add "#else\n"
-  code.add "static void JNICALL genny_jni_genny_reload(JNIEnv *env, jclass cls, jstring path) {\n"
-  code.add "  (void)cls; (void)path;\n"
-  code.add "  genny_throw(env, \"java/lang/UnsupportedOperationException\", \"built without GENNY_JAVA_HOT_RELOAD\");\n"
-  code.add "}\n"
-  code.add "#endif\n\n"
+  var names, assignments: string
+  for i, (name, ret, params) in bound:
+    names.add &"  \"{name}\",\n"
+    assignments.add &"  {name} = ({ret} (*)({params}))syms[{i}];\n"
+  code.add """
+#ifdef GENNY_JAVA_HOT_RELOAD
+static void *genny_prepared, *genny_previous;
+static int genny_activated;
+static void *genny_active_syms[@COUNT@], *genny_prepared_syms[@COUNT@], *genny_previous_syms[@COUNT@];
+static const char *const genny_names[] = {
+@NAMES@
+};
+static void genny_apply(void **syms) {
+@ASSIGN@
+}
+static void JNICALL genny_jni_genny_prepare(JNIEnv *env, jclass cls, jstring path) {
+  (void)cls;
+  if (genny_prepared || genny_activated) {
+    genny_throw(env, "java/lang/IllegalStateException", "reload transaction already active"); return;
+  }
+  if (!path) { genny_throw(env, "java/lang/NullPointerException", "path is null"); return; }
+  const char *p = (*env)->GetStringUTFChars(env, path, NULL);
+  if (!p) return;
+  void *h = dlopen(p, RTLD_NOW | RTLD_LOCAL);
+  (*env)->ReleaseStringUTFChars(env, path, p);
+  if (!h) { genny_throw(env, "java/lang/IllegalStateException", dlerror()); return; }
+  const char *(*abi)(void) = (const char *(*)(void))dlsym(h, "genny_abi_fingerprint");
+  if (!abi || strcmp(abi(), "@ABI@")) {
+    dlclose(h); genny_throw(env, "java/lang/IllegalStateException", "native ABI fingerprint mismatch; restart required"); return;
+  }
+  for (size_t i = 0; i < @BOUND@; i++) {
+    genny_prepared_syms[i] = dlsym(h, genny_names[i]);
+    if (!genny_prepared_syms[i]) {
+      char message[512];
+      snprintf(message, sizeof(message), "native library is missing symbol %s", genny_names[i]);
+      dlclose(h); genny_throw(env, "java/lang/IllegalStateException", message); return;
+    }
+  }
+  genny_prepared = h;
+}
+static void JNICALL genny_jni_genny_activate(JNIEnv *env, jclass cls) {
+  (void)cls;
+  if (!genny_prepared || genny_activated) {
+    genny_throw(env, "java/lang/IllegalStateException", "no prepared reload"); return;
+  }
+  genny_previous = genny_handle;
+  memcpy(genny_previous_syms, genny_active_syms, sizeof(genny_active_syms));
+  genny_handle = genny_prepared; genny_prepared = NULL;
+  memcpy(genny_active_syms, genny_prepared_syms, sizeof(genny_active_syms));
+  genny_apply(genny_active_syms); genny_bound = 1; genny_activated = 1;
+}
+static void JNICALL genny_jni_genny_commit(JNIEnv *env, jclass cls) {
+  (void)cls;
+  if (!genny_activated) { genny_throw(env, "java/lang/IllegalStateException", "no activated reload"); return; }
+  if (genny_previous) dlclose(genny_previous);
+  genny_previous = NULL; genny_activated = 0;
+}
+static void JNICALL genny_jni_genny_rollback(JNIEnv *env, jclass cls) {
+  (void)cls;
+  if (!genny_activated || !genny_previous) {
+    genny_throw(env, "java/lang/IllegalStateException", "no rollback generation"); return;
+  }
+  void *failed = genny_handle;
+  genny_handle = genny_previous; genny_previous = NULL;
+  memcpy(genny_active_syms, genny_previous_syms, sizeof(genny_active_syms));
+  genny_apply(genny_active_syms); genny_activated = 0;
+  dlclose(failed);
+}
+static void JNICALL genny_jni_genny_cancel(JNIEnv *env, jclass cls) {
+  (void)cls;
+  if (genny_activated) { genny_throw(env, "java/lang/IllegalStateException", "activated reload requires rollback"); return; }
+  if (genny_prepared) dlclose(genny_prepared);
+  genny_prepared = NULL;
+}
+static void JNICALL genny_jni_genny_reload(JNIEnv *env, jclass cls, jstring path) {
+  genny_jni_genny_prepare(env, cls, path);
+  if ((*env)->ExceptionCheck(env)) return;
+  genny_jni_genny_activate(env, cls);
+  if ((*env)->ExceptionCheck(env)) return;
+  genny_jni_genny_commit(env, cls);
+}
+#else
+#define GENNY_UNSUPPORTED() genny_throw(env, "java/lang/UnsupportedOperationException", "built without GENNY_JAVA_HOT_RELOAD")
+static void JNICALL genny_jni_genny_prepare(JNIEnv *env, jclass cls, jstring path) { (void)cls; (void)path; GENNY_UNSUPPORTED(); }
+static void JNICALL genny_jni_genny_reload(JNIEnv *env, jclass cls, jstring path) { (void)cls; (void)path; GENNY_UNSUPPORTED(); }
+static void JNICALL genny_jni_genny_activate(JNIEnv *env, jclass cls) { (void)cls; GENNY_UNSUPPORTED(); }
+static void JNICALL genny_jni_genny_rollback(JNIEnv *env, jclass cls) { (void)cls; GENNY_UNSUPPORTED(); }
+static void JNICALL genny_jni_genny_commit(JNIEnv *env, jclass cls) { (void)cls; GENNY_UNSUPPORTED(); }
+static void JNICALL genny_jni_genny_cancel(JNIEnv *env, jclass cls) { (void)cls; GENNY_UNSUPPORTED(); }
+#endif
+
+""".replace("@COUNT@", $max(1, bound.len)).replace("@BOUND@", $bound.len)
+    .replace("@NAMES@", names).replace("@ASSIGN@", assignments).replace("@ABI@", abi)
   code.add "static jboolean JNICALL genny_jni_genny_hot_reloadable(JNIEnv *env, jclass cls) {\n"
   code.add "  (void)env; (void)cls;\n"
   code.add "#ifdef GENNY_JAVA_HOT_RELOAD\n"
@@ -1213,6 +1286,9 @@ proc writeJava*(dir, lib: string): NimNode =
   code.add "static JNINativeMethod genny_jni_methods[] = {\n"
   code.add cMethods
   code.add "  {\"n_genny_reload\", \"(Ljava/lang/String;)V\", (void *)genny_jni_genny_reload},\n"
+  code.add "  {\"n_genny_prepare\", \"(Ljava/lang/String;)V\", (void *)genny_jni_genny_prepare},\n"
+  for phase in ["activate", "rollback", "commit", "cancel"]:
+    code.add &"  {{\"n_genny_{phase}\", \"()V\", (void *)genny_jni_genny_{phase}}},\n"
   code.add "  {\"n_genny_hot_reloadable\", \"()Z\", (void *)genny_jni_genny_hot_reloadable},\n"
   code.add "};\n\n"
   code.add "JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {\n"

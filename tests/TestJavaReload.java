@@ -66,13 +66,32 @@ public class TestJavaReload {
 
     t = throwsType(IllegalStateException.class, () -> TestReload.reload(abs(args[3])),
       "library missing a symbol is rejected");
-    check(t.getMessage().contains("test_reload_bonus"), "missing symbol is named");
+    check(t.getMessage().contains("fingerprint"), "changed exported API is rejected before binding");
     check(TestReload.version() == 2 && TestReload.bonus() == 7, "rejected library keeps the old one");
     try (Box after = new Box(3)) {
       check(after.getValue() == 3, "handles still work after a failed reload");
     }
 
     throwsType(NullPointerException.class, () -> TestReload.reload(null), "null path");
+    Box survivor = new Box(17);
+    TestReload.prepareReload(abs(args[1]));
+    check(TestReload.version() == 2 && survivor.getValue() == 17, "prepare preserves active generation and handles");
+    TestReload.cancelReload();
+    check(survivor.getValue() == 17, "cancel preserves active handles");
+    TestReload.prepareReload(abs(args[1]));
+    TestReload.activateReload();
+    check(TestReload.version() == 1, "activation retains previous generation");
+    throwsType(IllegalStateException.class, () -> survivor.getValue(), "activation invalidates old handles");
+    Box candidate = new Box(19);
+    TestReload.rollbackReload();
+    check(TestReload.version() == 2, "rollback restores previous function table");
+    throwsType(IllegalStateException.class, () -> survivor.getValue(), "rollback never revives old handles");
+    throwsType(IllegalStateException.class, () -> candidate.getValue(), "rollback invalidates candidate handles");
+    survivor.close(); candidate.close();
+    try (Box current = new Box(23)) {
+      throwsType(IllegalStateException.class, TestReload::activateReload, "unprepared activation rejected");
+      check(current.getValue() == 23, "unprepared activation preserves handles");
+    }
     System.out.println("All Java reload tests passed");
   }
 }

@@ -56,6 +56,26 @@ cc -shared -fPIC -DGENNY_JAVA_HOT_RELOAD -I$JAVA_HOME/include -I$JAVA_HOME/inclu
   bindings/generated/pixie_jni.c -ldl -o libpixie_loader.so
 ```
 
+The generated class provides `prepareReload(path)`, `activateReload()`,
+`rollbackReload()`, `commitReload()` and `cancelReload()`. Preparation checks
+every symbol and the generated ABI fingerprint without changing the active
+table. Activation retains the previous table and library handle; commit
+unloads the previous library, and rollback restores it after the failed
+candidate has been disposed. The caller must quiesce all native calls and
+stop every native thread before retiring a generation. Run untrusted candidate
+initialization in a separate process before calling prepare.
+
+`ABI_FINGERPRINT` covers exported signatures, value layouts, ref-object
+accessors, enums, constants and the error protocol. Incompatible API changes
+are rejected and need new Java bindings. Every activation and rollback
+advances the Java handle generation; rollback never revives old handles.
+Live and queued native references are released before changing generations.
+Nim string results remain owned by a thread-local holder until JNI finishes
+copying them, then JNI releases the holder. This includes error messages and
+string getters; returned pointers never outlive their Nim storage.
+`reload(path)` remains a convenience prepare/activate/commit sequence for
+applications that have already stopped their native runtime.
+
 ```java
 Pixie.load("/abs/libpixie_loader.so");
 Pixie.reload("/abs/build/libpixie-1.so"); // and again after every rebuild
@@ -63,7 +83,7 @@ Pixie.reload("/abs/build/libpixie-1.so"); // and again after every rebuild
 
 * Every call throws `IllegalStateException` until the first successful `reload`. `Pixie.hotReloadable()` tells a loader from a normal build, where `reload` throws `UnsupportedOperationException`.
 * A reload that cannot open the library or finds a missing export throws `IllegalStateException` and keeps the current library.
-* Each successful reload starts a new generation. Ref objects and seqs from an older generation throw `IllegalStateException` when used, and closing or collecting them does nothing; pending releases are dropped.
+* Each activation and rollback starts a new generation. Ref objects and seqs from an older generation throw `IllegalStateException` when used. Their references are released before switching; closing or collecting stale handles does nothing.
 * Copy each build to a new path before reloading: `dlopen` hands back the already loaded library for the same file.
 * Stop every thread that runs Nim code, and every call into the library, before reloading: the old library is unloaded.
 * The exported API must stay the same between reloads; regenerate and rebuild the loader (and restart the JVM) when it changes.
